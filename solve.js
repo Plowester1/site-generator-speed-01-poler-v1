@@ -123,8 +123,11 @@ export function uniqueSlug(slug, taken) {
   taken.add(out);
   return out;
 }
+const AMP = String.fromCharCode(38);
+const GT = AMP + 'gt;';
+const ESCAPES = { '&': AMP + 'amp;', '<': AMP + 'lt;', '>': GT, '"': AMP + 'quot;', "'": AMP + '#39;' };
 export function escapeHtml(text) {
-  return text.replace(/&/g, '&' + 'amp;').replace(/</g, '&' + 'lt;').replace(/>/g, '&' + 'gt;').replace(/"/g, '&' + 'quot;').replace(/'/g, '&' + '#39;');
+  return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 const BLANK = /^[ \t]*$/, FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/, FENCE_CLOSE = /^```[ \t]*$/;
 const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/, HR = /^(?:---|\*\*\*)[ \t]*$/, QUOTE = /^>/;
@@ -133,16 +136,37 @@ function headingOf(line) {
   const m = HEADING.exec(line);
   return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
 }
-const endsParagraph = (line) => BLANK.test(line) || FENCE_OPEN.test(line) || headingOf(line) !== null || HR.test(line);
-const trimLine = (line) => line.replace(/^[ \t]+|[ \t]+$/g, '');
+const isSpaceOrTab = (c) => c === ' ' || c === '\t';
+const isBlank = (line) => {
+  if (line === '') return true;
+  if (!isSpaceOrTab(line[0])) return false;
+  for (let i = 1; i < line.length; i++) if (!isSpaceOrTab(line[i])) return false;
+  return true;
+};
+const endsParagraph = (line) => {
+  const c = line[0];
+  if (c === undefined) return true;
+  if (c === '`') return FENCE_OPEN.test(line);
+  if (c === '#') return headingOf(line) !== null;
+  if (c === '-' || c === '*') return HR.test(line);
+  return isBlank(line);
+};
+const trimLine = (line) => {
+  let a = 0;
+  let b = line.length;
+  while (a < b && isSpaceOrTab(line[a])) a++;
+  while (b > a && isSpaceOrTab(line[b - 1])) b--;
+  return a === 0 && b === line.length ? line : line.slice(a, b);
+};
 export function lex(src) {
   const lines = src.split('\n');
   const tokens = [];
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (BLANK.test(line)) { i++; continue; }
-    const fence = FENCE_OPEN.exec(line);
+    const c0 = line[0];
+    if (c0 === undefined || isBlank(line)) { i++; continue; }
+    const fence = c0 === '`' ? FENCE_OPEN.exec(line) : null;
     if (fence !== null) {
       const body = [];
       i++;
@@ -151,25 +175,29 @@ export function lex(src) {
       tokens.push({ type: 'code', lang: fence[1], lines: body });
       continue;
     }
-    const heading = headingOf(line);
+    const heading = c0 === '#' ? headingOf(line) : null;
     if (heading !== null) { tokens.push({ type: 'heading', depth: heading.depth, text: heading.text }); i++; continue; }
-    if (HR.test(line)) { tokens.push({ type: 'hr' }); i++; continue; }
-    if (QUOTE.test(line)) {
+    if ((c0 === '-' || c0 === '*') && HR.test(line)) { tokens.push({ type: 'hr' }); i++; continue; }
+    if (c0 === '>' && QUOTE.test(line)) {
       const body = [];
       while (i < lines.length && QUOTE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
       tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
       continue;
     }
-    const bullet = BULLET.exec(line);
-    const ordered = bullet === null ? ORDERED.exec(line) : null;
+    const bullet = c0 === '-' || c0 === '*' ? BULLET.exec(line) : null;
+    const ordered = bullet === null && c0 >= '0' && c0 <= '9' ? ORDERED.exec(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? ORDERED : BULLET;
       const items = [];
       while (i < lines.length) {
-        const m = marker.exec(lines[i]);
+        const cur = lines[i];
+        const cc = cur[0];
+        const m = isOrdered
+          ? (cc >= '0' && cc <= '9' ? ORDERED.exec(cur) : null)
+          : (cc === '-' || cc === '*' ? BULLET.exec(cur) : null);
         if (m !== null) { items.push([trimLine(isOrdered ? m[2] : m[1])]); i++; }
-        else if (CONTINUED.test(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; }
+        else if (cc === ' ' && CONTINUED.test(cur)) { items[items.length - 1].push(trimLine(cur)); i++; }
         else break;
       }
       tokens.push({ type: 'list', ordered: isOrdered, start: isOrdered ? Number(ordered[1]) : 1, items: items.map((parts) => parts.join('\n')) });
@@ -200,46 +228,76 @@ function findSingleStar(s, from) {
   return -1;
 }
 export function inline(s, env) {
-  let out = '';
+  const parts = [];
+  let plain = 0;
   let i = 0;
   while (i < s.length) {
     const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) { out += escapeHtml(s[i + 1]); i += 2; continue; }
+    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
+      if (i > plain) parts.push(escapeHtml(s.slice(plain, i)));
+      parts.push(s[i + 1] === '>' ? GT : s[i + 1]);
+      i += 2;
+      plain = i;
+      continue;
+    }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) { out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`; i = j + 1; }
-      else { out += '`'; i++; }
+      if (i > plain) parts.push(escapeHtml(s.slice(plain, i)));
+      if (j > i + 1) {
+        parts.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
+        i = j + 1;
+      } else {
+        parts.push('`');
+        i++;
+      }
+      plain = i;
       continue;
     }
     if (c === '*') {
       if (s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) { out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`; i = j + 2; }
-        else { out += '**'; i += 2; }
+        if (i > plain) parts.push(escapeHtml(s.slice(plain, i)));
+        if (j > i + 2) {
+          parts.push('<strong>', inline(s.slice(i + 2, j), env), '</strong>');
+          i = j + 2;
+        } else {
+          parts.push('**');
+          i += 2;
+        }
+        plain = i;
         continue;
       }
       const j = findSingleStar(s, i + 1);
-      if (j > i + 1) { out += `<em>${inline(s.slice(i + 1, j), env)}</em>`; i = j + 1; }
-      else { out += '*'; i++; }
+      if (i > plain) parts.push(escapeHtml(s.slice(plain, i)));
+      if (j > i + 1) {
+        parts.push('<em>', inline(s.slice(i + 1, j), env), '</em>');
+        i = j + 1;
+      } else {
+        parts.push('*');
+        i++;
+      }
+      plain = i;
       continue;
     }
     if (c === '[') {
       const k = findUnescaped(s, ']', i + 1);
       const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
+      if (i > plain) parts.push(escapeHtml(s.slice(plain, i)));
       if (target !== '' && !/\s/.test(target)) {
-        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(i + 1, k), env)}</a>`;
+        parts.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(i + 1, k), env), '</a>');
         i = m + 1;
-        continue;
+      } else {
+        parts.push('[');
+        i++;
       }
-      out += '[';
-      i++;
+      plain = i;
       continue;
     }
-    out += escapeHtml(c);
     i++;
   }
-  return out;
+  if (plain < s.length) parts.push(escapeHtml(s.slice(plain)));
+  return parts.join('');
 }
 export function renderMarkdown(src, env) {
   const ids = new Set();
